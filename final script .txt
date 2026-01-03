@@ -1,0 +1,1372 @@
+setwd("D:/scRNA-seq/PBMC")
+
+library(DropletUtils)
+library(SingleCellExperiment)
+library(Seurat)
+library(Matrix)
+library(ggplot2)
+library(SeuratDisk)
+library(SeuratObject)
+library(DoubletFinder)
+library(scDblFinder)
+library(SingleR)
+library(celldex)
+library(patchwork)
+library(tidyverse)
+library(gridExtra)
+library(SoupX)
+library(scran)
+library(ggridges)
+library(decontX)
+library(celda)
+library(SeuratData)
+library(presto)
+library(dplyr)
+library(readxl)
+library(harmony)
+library(SingleR)
+library(SummarizedExperiment)
+library(DESeq2)
+library(pheatmap)
+library(EnhancedVolcano)
+library(glmGamPoi)
+library(future)
+
+#--------------------------#
+# 1. Sample processing: 
+#--------------------------#
+
+#Auto-detect all sample prefixes
+
+base <- "D:/scRNA-seq/PBMC"
+
+mtx_files <- list.files(base, pattern = "_matrix\\.mtx(\\.gz)?$", full.names = FALSE)
+
+# remove the suffix to keep only sample prefix
+samples <- gsub("_matrix\\.mtx(\\.gz)?$", "", mtx_files)
+
+message("Detected samples:")
+print(samples)
+message("Total samples detected: ", length(samples))
+
+
+# If some files have different naming (features.tsv.gz vs ), adjust below:
+suffix_features <- "_features.tsv.gz"    # or "_genes.tsv.gz"
+suffix_mtx      <- "_matrix.mtx.gz"
+suffix_barcodes <- "_barcodes.tsv.gz"
+# ---------------------------------------------------------#
+# Main loop for each sample
+# ---------------------------------------------------------#
+obj_list <- list()
+for (s in samples) {
+  
+  message("\n===============================")
+  message("Processing sample: ", s)
+  message("===============================\n")
+  
+  # -----------------------------#
+  # Load raw MatrixMarket files
+  # -----------------------------#
+  mtx  <- file.path(base, paste0(s, "_matrix.mtx.gz"))
+  fts  <- file.path(base, paste0(s, "_features.tsv.gz"))
+  cels <- file.path(base, paste0(s, "_barcodes.tsv.gz"))
+  
+  raw_cts <- ReadMtx(mtx = mtx, features = fts, cells = cels)
+  message(sprintf("[%s] raw matrix dims: %d genes x %d barcodes",
+                  s, nrow(raw_cts), ncol(raw_cts)))
+  
+  # -----------------------------#
+  # barcodeRanks → knee plot
+  # -----------------------------#
+  br <- barcodeRanks(raw_cts)
+  uniq <- !duplicated(br$rank)
+  brp <- br[uniq, ]
+  
+  knee <- metadata(br)$knee
+  inflection <- metadata(br)$inflection
+  
+  message(sprintf("[%s] knee = %s ; inflection = %s",
+                  s, knee, inflection))
+  
+  # Plot knee
+  p1 <- ggplot(as.data.frame(brp), aes(rank, total)) +
+    geom_point(size = 0.5) +
+    geom_hline(yintercept = knee, color = "red") +
+    geom_vline(xintercept = inflection, color = "blue", linetype = "dotted") +
+    scale_x_log10() + scale_y_log10() +
+    labs(
+      title = paste0(s, " — BarcodeRanks (knee & inflection)"),
+      x = "Rank (log10)",
+      y = "Total UMIs (log10)"
+    ) +
+    theme_classic()
+  
+  print(p1)
+  
+  # -----------------------------#
+  # emptyDrops with threshold = knee
+  # -----------------------------#
+  lower_thresh <- if (!is.null(knee) && is.finite(knee)) {
+    as.integer(max(1, floor(knee)))
+  } else {
+    100
+  }
+  
+  message(sprintf("[%s] Using lower threshold for emptyDrops(): %d",
+                  s, lower_thresh))
+  
+  e.out <- emptyDrops(raw_cts, lower = lower_thresh)
+  e.out <- e.out[order(e.out$FDR), ]
+  
+  message(sprintf("[%s] emptyDrops complete.", s))
+  print(head(e.out))
+  
+  # Histogram
+  p2 <- ggplot(as.data.frame(e.out), aes(Total)) +
+    geom_histogram(bins = 80) +
+    geom_vline(xintercept = lower_thresh, color = "red", linetype = "dashed") +
+    scale_x_log10() +
+    labs(
+      title = paste0(s, " — UMI count distribution"),
+      x = "UMI (log10)"
+    ) +
+    theme_classic()
+  
+  print(p2)
+  
+  # -----------------------------#
+  # Select barcodes considered as genuine cells
+  # -----------------------------#
+  pass_fdr   <- which(!is.na(e.out$FDR) & e.out$FDR < 0.001)
+  pass_total <- which(e.out$Total > lower_thresh)
+  keep_idx   <- sort(unique(c(pass_fdr, pass_total)))
+  cell_ids   <- rownames(e.out)[keep_idx]
+  
+  message(sprintf("[%s] Detected %d real cells.",
+                  s, length(cell_ids)))
+  
+  filt_cts <- raw_cts[, colnames(raw_cts) %in% cell_ids, drop = FALSE]
+  
+  # -----------------------------#
+  # AMBIENT RNA CORRECTION (DecontX)
+  # -----------------------------#
+  message(sprintf("[%s] Ambient RNA correction with DecontX...", s))
+  
+  sce <- SingleCellExperiment(list(counts = filt_cts))
+  sce <- decontX(sce)   # <-- decontamination step
+  
+  corrected <- decontXcounts(sce)   # extract corrected counts
+  
+  message(sprintf("[%s] DecontX correction complete.", s))
+  
+  # -----------------------------#
+  # Create Seurat object
+  # -----------------------------#
+  seu <- CreateSeuratObject(counts = corrected, project = s)
+  seu$sample <- s
+  seu <- RenameCells(seu, add.cell.id = s)
+  
+  obj_list[[s]] <- seu
+  
+  message(sprintf("[%s] Seurat object created: %d cells",
+                  s, ncol(seu)))
+}
+
+message("All samples processed successfully!")
+
+# =========================================================#
+#  MERGE ALL SAMPLES INTO ONE SEURAT OBJECT 
+# =========================================================#
+
+message("\nMerging all samples into a single Seurat object...\n")
+
+seu_merged <- Reduce(function(x, y) merge(x, y), obj_list)
+
+# ensure sample label persists
+seu_merged$sample <- sapply(
+  strsplit(colnames(seu_merged), "_"),
+  `[`,
+  1
+)
+
+message("Merge complete!\n")
+print(table(seu_merged$sample))
+
+View(seu_merged@meta.data)
+
+seu_merged$sample_id <- rownames(seu_merged@meta.data)
+
+View(seu_merged@meta.data)
+
+
+seu_merged@meta.data <- separate(seu_merged@meta.data, col = 'sample_id', into = c('Accession', 'Patient-id', 'Barcode'), 
+                          sep = '_')
+
+View(seu_merged@meta.data)
+
+
+sra <- read.csv("SraRunTable.csv")
+
+
+sra_clean <- sra %>%
+  rename(sample = Sample.Name) %>%      
+  select(sample, disease_state, sex) %>%
+  distinct(sample, .keep_all = TRUE)    # keep only 1 row per sample
+
+seu_meta <- seu_merged@meta.data
+
+seu_meta_new <- seu_meta %>%
+  left_join(sra_clean, by = "sample")
+
+seu_merged@meta.data <- seu_meta_new
+
+View(seu_merged@meta.data)
+
+
+# Save Seurat object
+saveRDS(seu_merged, file = "seu_merged.rds")
+
+# Load it later
+seu_merged <- readRDS("seu_merged.rds")
+
+
+head(rownames(seu_merged@meta.data))
+seu_merged <- JoinLayers(seu_merged)
+
+#--------------------------#
+# 2. QC: Mitochondrial content
+#--------------------------#
+
+
+# calculate mitochondrial percentage
+
+seu_merged$percent.mt <- PercentageFeatureSet(seu_merged, pattern='^MT-')  #human
+
+seu_merged$sample <- sub("_.*", "", colnames(seu_merged))
+
+table(seu_merged$sample)
+
+
+
+#We filter cells that have unique feature counts over 2,500 or less than 200
+#We filter cells that have >5% mitochondrial counts
+
+
+# Visualize QC metrics as a violin plot
+
+# --------------------------
+# Extract QC metrics
+# --------------------------
+qc_df <- data.frame(
+  cell         = rownames(seu_merged@meta.data),
+  nFeature_RNA = seu_merged$nFeature_RNA,
+  nCount_RNA   = seu_merged$nCount_RNA,
+  percent.mt   = seu_merged$percent.mt
+)
+
+# Add a dummy x-axis label to combine all cells
+qc_df$all <- "All Cells"
+
+# --------------------------
+# ggplot violin plots
+# --------------------------
+
+p1 <- ggplot(qc_df, aes(x = all, y = nFeature_RNA)) +
+  geom_violin(fill = "skyblue", trim = FALSE) +
+  geom_boxplot(width = 0.15, outlier.size = 0.3) +
+  theme_classic() +
+  labs(title = "nFeature_RNA", x = "", y = "Detected genes") +
+  theme(axis.text.x = element_blank())
+
+p2 <- ggplot(qc_df, aes(x = all, y = nCount_RNA)) +
+  geom_violin(fill = "lightgreen", trim = FALSE) +
+  geom_boxplot(width = 0.15, outlier.size = 0.3) +
+  theme_classic() +
+  labs(title = "nCount_RNA", x = "", y = "UMI counts") +
+  theme(axis.text.x = element_blank())
+
+p3 <- ggplot(qc_df, aes(x = all, y = percent.mt)) +
+  geom_violin(fill = "lightpink", trim = FALSE) +
+  geom_boxplot(width = 0.15, outlier.size = 0.3) +
+  theme_classic() +
+  labs(title = "percent.mt", x = "", y = "Percent mitochondrial genes") +
+  theme(axis.text.x = element_blank())
+
+# --------------------------
+# Combine all plots
+# --------------------------
+(p1 | p2 | p3)
+
+# Filter low-quality cells (QC thresholds) #thrshold Seurat Tutorial
+seu_merged.filtered <- subset(seu_merged, subset = nFeature_RNA > 200 & nFeature_RNA < 2500 & percent.mt < 5)
+#seu_merged.filtered <- subset(seu_merged, subset = nFeature_RNA > 200 & percent.mt < 5)
+
+View(seu_merged.filtered@meta.data)
+
+# Save Seurat object
+saveRDS(seu_merged.filtered, file = "seu_merged.filtered.rds")
+
+# Load it later
+seu_merged <- readRDS("seu_merged.filtered.rds")
+
+View(seu_merged@meta.data)
+
+gene_of_interest <- c("GAPDH")
+# Extract metadata + expression
+df <- FetchData(seu_merged.filtered, 
+                vars = c("disease_state", gene_of_interest),
+                assay = "RNA",
+                slot = "counts")
+
+df$expr <- df[, gene_of_interest]
+
+# Plot with violin + boxplot (outliers included)
+ggplot(df, aes(x = disease_state, y = expr, fill = disease_state)) +
+  geom_violin(trim = FALSE, alpha = 0.6) +
+  geom_boxplot(width = 0.2, outlier.colour = "black", outlier.size = 1.5) +
+  theme_classic() +
+  labs(
+    title = "GAPDH Expression Distribution per Group",
+    y = "Expression (counts)",
+    x = "Disease State"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+
+#Bar plot + SD error bars + outlier points
+
+# Summaries
+df_summary <- df %>%
+  group_by(disease_state) %>%
+  summarise(
+    mean_expr = mean(expr, na.rm = TRUE),
+    sd_expr   = sd(expr, na.rm = TRUE)
+  )
+
+ggplot() +
+  # Raw points (outliers included)
+  geom_jitter(data = df, aes(x = disease_state, y = expr),
+              width = 0.15, alpha = 0.4, size = 1.2) +
+  
+  # Bar representing mean
+  geom_bar(
+    data = df_summary,
+    aes(x = disease_state, y = mean_expr, fill = disease_state),
+    stat = "identity",
+    alpha = 0.7
+  ) +
+  
+  # SD error bars
+  geom_errorbar(
+    data = df_summary,
+    aes(
+      x = disease_state,
+      ymin = mean_expr - sd_expr,
+      ymax = mean_expr + sd_expr
+    ),
+    width = 0.2,
+    linewidth = 0.8
+  ) +
+  
+  theme_classic() +
+  labs(
+    title = "Mean GAPDH Expression per Group (with SD & Outliers)- Pre-normalization",
+    y = "Expression (counts)",
+    x = "Disease State"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+#Box plot + outliers + mean point
+
+ggplot(df, aes(x = disease_state, y = expr, fill = disease_state)) +
+  geom_boxplot(
+    outlier.colour = "black",
+    outlier.size   = 1.4,
+    alpha          = 0.7
+  ) +
+  
+  # Add mean point
+  stat_summary(
+    fun = mean,
+    geom = "point",
+    shape = 23,
+    size = 3,
+    fill = "red"
+  ) +
+  
+  theme_classic() +
+  labs(
+    title = "GAPDH Expression per Group",
+    y = "Expression (counts)",
+    x = "Disease State"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+#--------------------------#
+# 3. Normalization & Feature Selection
+#--------------------------#
+seu_merged.filtered <- NormalizeData(seu_merged.filtered, normalization.method = "LogNormalize")
+seu_merged.filtered <- FindVariableFeatures(seu_merged.filtered, selection.method = "vst", nfeatures = 3000)
+seu_merged.filtered <- ScaleData(seu_merged.filtered)
+seu_merged.filtered <- RunPCA(seu_merged.filtered, npcs = 30, verbose = FALSE)
+# --- Disable all parallelization (future) ---
+
+future::plan(sequential)              # force sequential execution
+options(future.plan = "sequential")   
+options(future.fork.enable = FALSE)   # disable forking
+options(future.rng.onMisuse = "ignore")
+Sys.setenv(FUTURE_DISABLE_PARALLEL = "true")
+
+# --- Fix working directory & temporary directory ---
+setwd("~")                            # ensure valid working directory
+Sys.setenv(TMPDIR = "/tmp")           # safe temp directory
+tempdir()                             # check temp path
+
+seu_merged.filtered <- FindNeighbors(seu_merged.filtered, dims = 1:15)
+seu_merged.filtered <- FindClusters(seu_merged.filtered, resolution = 0.5)
+seu_merged.filtered <- RunUMAP(seu_merged.filtered, dims = 1:15)
+
+P1 <- DimPlot(seu_merged.filtered, group.by = "disease_state", pt.size = 0.2)
+P2 <- DimPlot(seu_merged.filtered, group.by = "sex", pt.size = 0.2)
+
+P1+P2
+#OR
+
+P1 <- DimPlot(
+  seu_merged.filtered,
+  group.by = "disease_state",
+  pt.size = 0.8
+) + 
+  scale_color_manual(values = c(
+    "exposed"      = "#E41A1C",
+    "healthy"      = "#4DAF4A",
+    "hospitalized" = "#377EB8",
+    "infected"     = "#FF7F00"
+  )) +
+  theme(
+    legend.text = element_text(size = 12),
+    legend.title = element_text(size = 13)
+  )
+P2 <- DimPlot(
+  seu_merged.filtered,
+  group.by = "sex",
+  pt.size = 0.8
+) + 
+  scale_color_manual(values = c(
+    "female" = "#E69F00",
+    "male"   = "#56B4E9"
+  )) +
+  theme(
+    legend.text = element_text(size = 12),
+    legend.title = element_text(size = 13)
+  )
+P1 + P2
+
+View(seu_merged.filtered@meta.data)
+
+#--------------------------#
+# 5. Cell Cycle Scoring
+#--------------------------#
+
+
+feat_s <- cc.genes$s.genes
+feat_g2m <- cc.genes$g2m.genes
+feat_s
+feat_g2m
+
+# The CellCycleScoring() function the scores each cell based on speci c features for S-phase/G2M-phase. For a given cell with signifcant high S.Score or G2M.Score they are assigned as S/G2M. 
+#Cells with low both S.Score and G2M.Score were assigned as G1.
+#This will overestimate cells in S-/G2M-phases in the tissues with low cell cycle i.e. neurons.
+
+DefaultAssay(seu_merged.filtered) <- "RNA"
+seu_merged.filtered <- CellCycleScoring(seu_merged.filtered, s.features = feat_s, g2m.features = feat_g2m)
+
+dat_s <- data.frame(cell_id = Cells(seu_merged.filtered), cat = "S_Score", Phase = seu_merged.filtered$Phase,
+                    score = seu_merged.filtered$S.Score)
+dat_g2m <- data.frame(cell_id = Cells(seu_merged.filtered), cat = "G2M_Score", Phase = seu_merged.filtered$Phase,
+                      score = seu_merged.filtered$G2M.Score)
+dat <- rbind(dat_s, dat_g2m)
+dat$Phase <- factor(dat$Phase, levels = c("G1", "S", "G2M"))
+
+ggplot(dat, aes(x = Phase, y = score, fill = Phase)) + geom_violin() + labs(x = "",
+                                                                            y = "Score", fill = "Phase") + facet_wrap(~cat) + theme_classic()
+
+
+#--------------------------#
+# 6. Doublet Detection
+#--------------------------#
+patients <- unique(seu_merged.filtered$`Patient-id`)
+
+seu_merged.filtered$doublet <- NA
+seu_merged.filtered$doublet_score <- NA
+
+for (p in patients) {
+  message("Processing: ", p)
+  
+  cells <- colnames(seu_merged.filtered)[seu_merged.filtered$`Patient-id` == p]
+  
+  sce_sub <- as.SingleCellExperiment(seu_merged.filtered[, cells])
+  sce_sub <- scDblFinder(
+    sce_sub,
+    clusters = sce_sub$seurat_clusters,
+    samples  = sce_sub$`Patient-id`
+  )
+  
+  seu_merged.filtered$doublet[cells]       <- colData(sce_sub)$scDblFinder.class
+  seu_merged.filtered$doublet_score[cells] <- colData(sce_sub)$scDblFinder.score
+}
+
+View(seu_merged.filtered@meta.data)
+
+
+seu_merged.filtered$doublet <- factor(
+  seu_merged.filtered$doublet,
+  levels = c(1, 2),
+  labels = c("singlet", "doublet")
+)
+
+View(seu_merged.filtered@meta.data)
+
+table(seu_merged.filtered$doublet)
+
+FeaturePlot(seu_merged.filtered, features = "doublet_score")
+
+DimPlot(
+  seu_merged.filtered,
+  group.by = "doublet",
+  reduction = "umap",
+  cols = c("gray", "red")   # singlet = gray, doublet = red
+) + ggtitle("UMAP Highlighting Doublets")
+
+seu.singlets <- subset(seu_merged.filtered, subset = doublet == "singlet")
+
+
+table(seu.singlets$doublet)
+View(seu.singlets@meta.data)
+
+
+DimPlot(
+  seu.singlets,
+  reduction = "umap",
+  group.by = "seurat_clusters"
+) + ggtitle("UMAP of Singlets Only")
+
+
+DimPlot(
+  seu.singlets,
+  reduction = "umap",
+  group.by = "disease_state"
+)
+
+# Save Seurat object
+saveRDS(seu.singlets, file = "seu.singlets.rds")
+
+# Load it later
+seu.singlets <- readRDS("seu.singlets.rds")
+
+View(seu.singlets@meta.data)
+
+# ===========================================================
+# 7. Subset => Regress out confouders and Data Integration
+# ===========================================================
+
+#____________________Subset Seurat Object_____________________#
+
+#Option 1: Randomly subset cells (best for pipeline testing)
+
+set.seed(123)
+
+seu.sub <- subset(
+  seu.singlets,
+  cells = sample(
+    colnames(seu.singlets),
+    size = 5000   # adjust (e.g., 2k–10k)
+  )
+)
+
+seu.sub
+
+#Option 2: Subset by clusters (biologically meaningful)
+
+table(seu.singlets$seurat_clusters)
+
+seu.sub <- subset(
+  seu.singlets,
+  idents = c(0, 1, 3, 5)  # choose representative clusters
+)
+
+#Option 3: Downsample per cluster 
+
+seu.sub <- subset(
+  seu.singlets,
+  downsample = 500   # 500 cells per cluster
+)
+
+#Option 4: Subset by samples / batches 
+seu.singlets <- readRDS("seu.singlets.rds")
+colnames(seu.singlets@meta.data)
+
+table(seu.singlets$disease_state)
+table(seu.singlets$sex)
+table(seu.singlets$orig.ident)
+
+meta_sample <- seu.singlets@meta.data %>%
+  distinct(orig.ident, disease_state, sex)
+
+meta_sample
+
+table(meta_sample$disease_state, meta_sample$sex)
+
+#Subset 4 samples/disease state- 2M/2F
+#hospitalized has 1F so 3M has been chosen
+set.seed(123)
+
+meta <- meta_sample  # using your existing object
+
+selected_samples <- meta %>%
+  group_by(disease_state) %>%
+  group_modify(~{
+    df <- .x
+    
+    n_female <- sum(df$sex == "female")
+    n_male   <- sum(df$sex == "male")
+    
+    if (n_female >= 2 & n_male >= 2) {
+      bind_rows(
+        df %>% filter(sex == "female") %>% slice_sample(n = 2),
+        df %>% filter(sex == "male")   %>% slice_sample(n = 2)
+      )
+    } else {
+      # fallback: take max available females, fill with males
+      bind_rows(
+        df %>% filter(sex == "female"),
+        df %>% filter(sex == "male") %>%
+          slice_sample(n = 4 - n_female)
+      )
+    }
+  }) %>%
+  ungroup()
+
+
+seu.sub <- subset(
+  seu.singlets,
+  subset = orig.ident %in% selected_samples$orig.ident
+)
+
+table(seu.sub$disease_state, seu.sub$sex)
+
+seu.sub@meta.data %>%
+  distinct(orig.ident, disease_state) %>%
+  count(disease_state)
+
+saveRDS(seu.sub, file = "seu_sub_selected_samples.rds")
+
+seu.sub <- readRDS("seu_sub_selected_samples.rds")
+
+#__________________lognormalize + Harmony_______________________#
+
+# Set RNA as default assay
+DefaultAssay(seu.sub) <- "RNA"
+
+# Normalize data (log-normalization)
+seu <- NormalizeData(
+  seu.sub,
+  normalization.method = "LogNormalize",
+  scale.factor = 10000,
+  verbose = FALSE
+)
+
+# Find variable features
+seu <- FindVariableFeatures(
+  seu,
+  selection.method = "vst",
+  nfeatures = 2000,
+  verbose = FALSE
+)
+
+# Scale data
+# Regress out MT genes & cell cycle if needed
+seu <- ScaleData(
+  seu,
+  features = VariableFeatures(seu),
+  vars.to.regress = c("percent.mt", "S.Score", "G2M.Score"),
+  verbose = FALSE
+)
+
+# PCA
+seu <- RunPCA(
+  seu,
+  npcs = 50,
+  verbose = FALSE
+)
+
+# Harmony integration
+seu <- RunHarmony(
+  seu,
+  group.by.vars = "orig.ident",
+  dims.use = 1:30,
+  verbose = FALSE
+)
+
+# UMAP on Harmony embeddings
+seu <- RunUMAP(
+  seu,
+  reduction = "harmony",
+  dims = 1:30
+)
+
+# Neighbors + clustering
+seu <- FindNeighbors(
+  seu,
+  reduction = "harmony",
+  dims = 1:30
+)
+
+seu <- FindClusters(
+  seu,
+  resolution = 0.5
+)
+
+
+# ===========================================================
+# 8. PLOTS
+# ===========================================================
+# Check reductions
+Reductions(seu)
+
+# Batch mixing check
+DimPlot(
+  seu,
+  reduction = "umap",
+  group.by = "orig.ident"
+)
+
+# Biology check
+DimPlot(
+  seu,
+  reduction = "umap",
+  label = TRUE
+)
+
+
+
+DimPlot(
+  seu,
+  reduction = "umap",
+  group.by = "disease_state"
+)
+
+DimPlot(
+  seu,
+  reduction = "umap",
+  group.by = "sex"
+)
+
+DimPlot(
+  seu,
+  reduction = "umap",
+  split.by = "disease_state"
+)
+
+
+#Cluster size & composition
+table(Idents(seu))
+prop.table(table(Idents(seu), seu$disease_state), margin = 1)
+
+# ===========================================================
+#9.Identify cluster markers
+# ===========================================================
+
+DefaultAssay(seu) <- "RNA"
+
+#Find markers for all clusters
+markers <- FindAllMarkers(
+  seu,
+  only.pos = TRUE,
+  min.pct = 0.25,
+  logfc.threshold = 0.25
+)
+
+#Save markers
+write.csv(markers, "cluster_markers_all.csv", row.names = FALSE)
+
+#Top markers per cluster
+top10 <- markers %>%
+  group_by(cluster) %>%
+  slice_max(order_by = avg_log2FC, n = 10)
+
+write.csv(top10, "cluster_top10_markers.csv", row.names = FALSE)
+
+#Heatmap (top markers)
+
+DoHeatmap(
+  seu,
+  features = top10$gene,
+  group.by = "seurat_clusters"
+)
+
+#DotPlot (cell-type inspection)
+DotPlot(
+  seu,
+  features = unique(top10$gene)
+) + RotatedAxis()
+
+#Feature plots 
+FeaturePlot(
+  seu,
+  features = c("TGFB1", "SOD1", "MMP9", "MBP"),
+  cols = c("lightgrey", "red")
+)
+
+#markers for one cluster (Eg. cluster 3) vs all others
+cluster_markers <- FindMarkers(
+  seu,
+  ident.1 = 3,
+  only.pos = TRUE, #Only positive markers 
+  min.pct = 0.25,
+  logfc.threshold = 0.25
+)
+
+
+#Top markers-
+top_markers <- cluster_markers %>%
+  rownames_to_column("gene") %>%
+  arrange(desc(avg_log2FC)) %>%
+  slice_head(n = 20)
+
+top_markers
+
+#FeaturePlot
+FeaturePlot(
+  seu,
+  features = top_markers$gene[1:4]
+)
+
+#DotPlot
+DotPlot(
+  seu,
+  features = top_markers$gene[1:10]
+) + RotatedAxis()
+
+#Save markers
+write.csv(
+  cluster_markers,
+  "cluster3_markers.csv"
+)
+
+#Cluster vs specific cluster (pairwise)
+
+cluster3_vs_5 <- FindMarkers(
+  seu,
+  ident.1 = 3,
+  ident.2 = 5,
+  only.pos = TRUE
+)
+
+# ===========================================================
+#10.Cluster annotation- SingleR
+# ===========================================================
+# Extract log-normalized data
+Idents(seu) <- "seurat_clusters"
+expr <- GetAssayData(seu, assay = "RNA", slot = "data")
+
+#Choose a reference dataset
+ls("package:celldex")
+#Inspect a dataset before using it
+ref <- MonacoImmuneData()
+unique(ref$label.fine)
+
+ref <- MonacoImmuneData()
+#Run SingleR
+singleR.cluster <- SingleR(
+  test = expr,
+  ref = ref,
+  labels = ref$label.main,                   #labels = ref$label.fine (for more resolution)
+  clusters = Idents(seu)
+)
+
+##Attach labels to Seurat object##
+# Create a named vector: cluster → cell type
+cluster2celltype <- singleR.cluster$labels
+names(cluster2celltype) <- rownames(singleR.cluster)
+
+# Map to each cell
+seu$SingleR_label <- unname(
+  cluster2celltype[as.character(seu$seurat_clusters)]
+)
+table(seu$SingleR_label)
+Idents(seu) <- "SingleR_label"
+levels(seu)
+
+##############################
+# Visualization of cell-type annotation
+##############################
+
+# UMAP colored by SingleR-assigned cell types
+# Purpose: Check whether automated annotations align with cluster structure
+DimPlot(
+  seu,
+  group.by = "SingleR_label",
+  label = TRUE,
+  repel = TRUE
+)
+
+# DotPlot of canonical immune markers across SingleR labels
+# Purpose: Biological validation of SingleR annotations
+DotPlot(
+  seu,
+  features = c(
+    "CD3D", "CD4", "CD8A",      # T cell markers
+    "NKG7", "GNLY",             # NK cell markers
+    "MS4A1",                    # B cell marker
+    "LYZ", "FCGR3A",            # Monocyte markers
+    "FCER1A"                    # Dendritic cell marker
+  ),
+  group.by = "SingleR_label"
+) + RotatedAxis()
+
+
+
+##############################
+# Monocyte-specific differential expression
+##############################
+
+# Subset monocytes based on SingleR annotation
+# Purpose: Cell-type–specific DE analysis
+mono <- subset(seu, idents = "Monocytes")
+
+# Set identity to disease state for DE testing
+Idents(mono) <- "disease_state"
+
+# Differential expression: Hospitalized vs Healthy monocytes
+mono_DE <- FindMarkers(
+  mono,
+  ident.1 = "hospitalized",
+  ident.2 = "healthy"
+)
+
+##############################
+# Volcano plot (Monocytes)
+##############################
+# Add gene names explicitly
+mono_DE$gene <- rownames(mono_DE)
+
+# Volcano plot
+# Purpose: Global overview of DE genes and effect sizes
+EnhancedVolcano(
+  mono_DE,
+  lab = mono_DE$gene,
+  x = "avg_log2FC",
+  y = "p_val_adj",
+  pCutoff = 0.05,
+  FCcutoff = 0.25,
+  title = "Monocytes: Hospitalized vs Healthy",
+  subtitle = "COVID-19 PBMC",
+  caption = "Log-normalized RNA, Wilcoxon test",
+  labSize = 3,
+  pointSize = 1.5,
+  max.overlaps = 15
+)
+
+##############################
+# Select top DE genes (Monocytes)
+##############################
+# Top 20 significantly upregulated genes in hospitalized patients
+top_genes <- mono_DE %>%
+  filter(p_val_adj < 0.05) %>%
+  arrange(desc(avg_log2FC)) %>%
+  slice_head(n = 20) %>%
+  pull(gene)
+
+##############################
+# Custom volcano-style scatter (ggplot) (Monocytes)
+##############################
+
+# Annotate direction of change
+mono_DE$significant <- "NS"
+mono_DE$significant[
+  mono_DE$p_val_adj < 0.05 & mono_DE$avg_log2FC > 0
+] <- "Up (Hospitalized)"
+mono_DE$significant[
+  mono_DE$p_val_adj < 0.05 & mono_DE$avg_log2FC < 0
+] <- "Up (Healthy)"
+
+# Purpose: Publication-ready volcano with directionality
+ggplot(mono_DE, aes(x = avg_log2FC, y = -log10(p_val_adj))) +
+  geom_point(aes(color = significant), alpha = 0.6, size = 1) +
+  scale_color_manual(
+    values = c(
+      "Up (Hospitalized)" = "red",
+      "Up (Healthy)" = "blue",
+      "NS" = "grey"
+    )
+  ) +
+  geom_vline(xintercept = c(-0.25, 0.25), linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  theme_classic() +
+  labs(
+    title = "Monocytes: Hospitalized vs Healthy",
+    x = "avg log2 Fold Change",
+    y = "-log10 adjusted p-value"
+  )
+
+##############################
+# Heatmap of average expression (Monocytes)
+##############################
+
+# Scale only the selected DE genes
+# Purpose: Improve contrast in heatmap visualization
+mono <- ScaleData(
+  mono,
+  features = top_genes,
+  verbose = FALSE
+)
+
+# Average expression per disease state
+avg_exp <- AverageExpression(
+  mono,
+  assays = "RNA",
+  group.by = "disease_state"
+)$RNA
+
+# Heatmap
+# Purpose: Compare DE gene expression patterns across conditions
+pheatmap(
+  avg_exp[top_genes, ],
+  scale = "row",
+  clustering_distance_rows = "correlation",
+  clustering_distance_cols = "correlation",
+  fontsize_row = 7,
+  main = "Top DE genes in Monocytes"
+)
+
+##############################
+# DotPlot of top DE genes (Monocytes)
+##############################
+
+# Purpose: Show detection frequency and expression strength
+DotPlot(
+  mono,
+  features = top_genes[1:10],
+  group.by = "disease_state"
+) +
+  RotatedAxis() +
+  ggtitle("Top monocyte DE genes")
+
+##############################
+# Feature plots for key inflammatory genes (Monocytes)
+##############################
+
+# Purpose: Spatial expression differences on UMAP
+FeaturePlot(
+  mono,
+  features = c("S100A8", "S100A9", "LYZ", "IFITM3"),
+  split.by = "disease_state",
+  cols = c("lightgrey", "red")
+)
+
+##############################
+# Cell-type marker heatmaps (global)
+##############################
+
+# Identify top markers per cluster
+celltype_markers <- FindAllMarkers(
+  seu,
+  only.pos = TRUE,
+  min.pct = 0.25,
+  logfc.threshold = 0.25
+)
+
+top10 <- celltype_markers %>%
+  group_by(cluster) %>%
+  slice_max(avg_log2FC, n = 10)
+
+# Scale genes for heatmap
+seu <- ScaleData(
+  seu,
+  features = unique(top10$gene),
+  verbose = FALSE
+)
+
+# Heatmap of top markers per SingleR label
+# Purpose: Confirm identity-specific gene programs
+DoHeatmap(
+  seu,
+  features = unique(top10$gene),
+  group.by = "SingleR_label",
+  label = TRUE
+) +
+  NoLegend() +
+  ggtitle("Top markers per SingleR-annotated cell type")
+
+##############################
+# Canonical immune marker  (global)
+##############################
+
+# Purpose: Manual biological validation
+immune_markers <- list(
+  "CD4+ T cells" = c("CD3D", "CD3E", "CD4", "IL7R"),
+  "CD8+ T cells" = c("CD3D", "CD8A", "CD8B", "GZMK"),
+  "NK cells" = c("NKG7", "GNLY", "PRF1"),
+  "B cells" = c("MS4A1", "CD79A", "CD74"),
+  "Monocytes" = c("LYZ", "FCGR3A", "S100A8", "S100A9"),
+  "Dendritic cells" = c("FCER1A", "CST3")
+)
+
+marker_genes <- unique(unlist(immune_markers))
+
+seu <- ScaleData(
+  seu,
+  features = marker_genes,
+  verbose = FALSE
+)
+
+DoHeatmap(
+  seu,
+  features = marker_genes,
+  group.by = "SingleR_label"
+) +
+  ggtitle("Canonical immune marker expression")
+
+
+# Differential expression: Hospitalized vs Healthy 
+##############################
+# Set disease_state as active identity
+##############################
+
+# Check available metadata
+colnames(seu@meta.data)
+
+# Set identities to disease_state
+Idents(seu) <- "disease_state"
+
+# Verify identity levels
+levels(seu)
+
+##############################
+# Differential expression: Hospitalized vs Healthy
+##############################
+
+Disease_DE <- FindMarkers(
+  seu,
+  ident.1 = "hospitalized",
+  ident.2 = "healthy",
+  logfc.threshold = 0.25,
+  min.pct = 0.1
+)
+
+# Add gene names
+Disease_DE$gene <- rownames(Disease_DE)
+
+# Inspect results
+head(Disease_DE)
+
+
+##############################
+# Save DE results as TSV
+##############################
+
+write.table(
+  Disease_DE,
+  file = "Disease_Hospitalized_vs_Healthy_DE.tsv",
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+
+##############################
+# Volcano plot (EnhancedVolcano)
+##############################
+
+EnhancedVolcano(
+  Disease_DE,
+  lab = Disease_DE$gene,
+  x = "avg_log2FC",
+  y = "p_val_adj",
+  pCutoff = 0.05,
+  FCcutoff = 0.25,
+  title = "Hospitalized vs Healthy (All Cells)",
+  subtitle = "Wilcoxon test, log-normalized RNA",
+  caption = "Seurat FindMarkers",
+  labSize = 3,
+  pointSize = 1.5,
+  max.overlaps = 15
+)
+
+##############################
+# Custom ggplot volcano
+##############################
+
+Disease_DE <- Disease_DE %>%
+  mutate(
+    significance = case_when(
+      p_val_adj < 0.05 & avg_log2FC > 0 ~ "Up in Hospitalized",
+      p_val_adj < 0.05 & avg_log2FC < 0 ~ "Up in Healthy",
+      TRUE ~ "Not Significant"
+    )
+  )
+
+ggplot(Disease_DE, aes(x = avg_log2FC, y = -log10(p_val_adj))) +
+  geom_point(aes(color = significance), alpha = 0.6, size = 1) +
+  scale_color_manual(
+    values = c(
+      "Up in Hospitalized" = "red",
+      "Up in Healthy" = "blue",
+      "Not Significant" = "grey"
+    )
+  ) +
+  geom_vline(xintercept = c(-0.25, 0.25), linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  theme_classic() +
+  labs(
+    title = "Hospitalized vs Healthy",
+    x = "avg log2 Fold Change",
+    y = "-log10 adjusted p-value",
+    color = ""
+  )
+
+##############################
+# Heatmap of top disease markers
+##############################
+
+top_genes <- Disease_DE %>%
+  filter(p_val_adj < 0.05) %>%
+  arrange(desc(abs(avg_log2FC))) %>%
+  slice_head(n = 30) %>%
+  pull(gene)
+
+seu <- ScaleData(
+  seu,
+  features = top_genes,
+  verbose = FALSE
+)
+
+avg_exp <- AverageExpression(
+  seu,
+  assays = "RNA",
+  group.by = "disease_state"
+)$RNA
+
+pheatmap(
+  avg_exp[top_genes, ],
+  scale = "row",
+  clustering_distance_rows = "correlation",
+  clustering_distance_cols = "correlation",
+  fontsize_row = 7,
+  main = "Top disease-associated genes"
+)
+
+##############################
+# DimPlot split by disease state
+##############################
+
+DimPlot(
+  seu,
+  group.by = "disease_state",
+  split.by = "disease_state",
+  label = FALSE
+) +
+  ggtitle("UMAP split by disease state")
+
+##############################
+# DimPlot showing disease state on same UMAP
+##############################
+
+DimPlot(
+  seu,
+  group.by = "disease_state",
+  label = TRUE,
+  repel = TRUE
+) +
+  ggtitle("UMAP colored by disease state")
+
+##############################
+# Feature (Dim-style) plots for DE markers
+##############################
+
+markers <- c("IL7R", "LTB", "CD3E", "CXCR4", "C12orf57", "MPP1")
+
+# UMAP expression (all cells)
+FeaturePlot(
+  seu,
+  features = markers,
+  cols = c("lightgrey", "red"),
+  reduction = "umap",
+  ncol = 3
+)
+
+##############################
+# Split by disease state (Hospitalized vs Healthy)
+##############################
+markers.2 <- c("IL7R", "CXCR4", "C12orf57")
+
+FeaturePlot(
+  seu,
+  features = markers.2,
+  split.by = "disease_state",
+  cols = c("lightgrey", "red"),
+  reduction = "umap",
+  ncol = 3
+)
+
+##############################
+# cell-type–restricted view (e.g. T cells)
+##############################
+
+
+###Subset T cells 
+
+# Check current identities
+Idents(seu)
+
+# Set identities to SingleR cell types
+Idents(seu) <- "SingleR_label"
+
+# Check available cell-type labels
+levels(seu)
+
+# Subset T cells (use EXACT label from levels())
+tcell <- subset(seu, idents = c("T cells", "CD4+ T cells", "CD8+ T cells"))
+
+
+# Feature plots for markers in T cells
+markers <- c("IL7R", "CXCR4", "C12orf57")
+
+FeaturePlot(
+  tcell,
+  features = markers,
+  split.by = "disease_state",
+  cols = c("lightgrey", "red"),
+  ncol = 3
+)
+
+
+####________________Merge references into a single reference object______________________###
+
+# Load multiple references
+ref1 <- MonacoImmuneData()
+ref2 <- HumanPrimaryCellAtlasData()
+
+# Combine expression matrices
+combined_expr <- cbind(assay(ref1), assay(ref2))
+
+# Combine metadata
+combined_meta <- rbind(colData(ref1), colData(ref2))
+
+# Create a new SummarizedExperiment object
+ref_combined <- SummarizedExperiment(
+  assays = list(logcounts = combined_expr),
+  colData = combined_meta
+)
+
+# Run SingleR
+singleR.cluster <- SingleR(
+  test = expr,
+  ref = ref_combined,
+  labels = ref_combined$label.main,
+  clusters = Idents(seu)
+)
+
+
+
